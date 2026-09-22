@@ -14,5 +14,12 @@ typedef enum
     StrID_Mode_Choices,
     StrID_PreviewNormals_Param_Name,
     StrID_HeightMap_Param_Name,
+    StrID_ShadowHardness_Param_Name,
+    StrID_HeightBlurRadius_Param_Name,
+    StrID_HeightCurveExponent_Param_Name,
+    StrID_CoarseDetailStrength_Param_Name,
+    StrID_FineDetailStrength_Param_Name,
+    StrID_EnableFaceDetection_Param_Name,
+    StrID_EyeProtectionStrength_Param_Name,
     StrID_NUMTYPES
 } StrIDType;

@@ -31,6 +31,20 @@ TableString g_strs[StrID_NUMTYPES] = {
     "Preview Normal Map",
     StrID_HeightMap_Param_Name,
     "Height Map (optional)",
+    StrID_ShadowHardness_Param_Name,
+    "Shadow Hardness",
+    StrID_HeightBlurRadius_Param_Name,
+    "Height Blur Radius",
+    StrID_HeightCurveExponent_Param_Name,
+    "Height Curve Exponent",
+    StrID_CoarseDetailStrength_Param_Name,
+    "Coarse Detail Strength",
+    StrID_FineDetailStrength_Param_Name,
+    "Fine Detail Strength",
+    StrID_EnableFaceDetection_Param_Name,
+    "Enable Face Detection",
+    StrID_EyeProtectionStrength_Param_Name,
+    "Eye Protection Strength",
 };
 
 char* GetStringPtr(int strNum)

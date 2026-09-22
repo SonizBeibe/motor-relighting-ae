@@ -1,0 +1,21 @@
+# Build output
+build/
+src/RelightFX/Win/x64/
+src/RelightFX/Win/*.rc
+*.aex
+*.ilk
+*.pdb
+*.exp
+*.lib
+*.tlog
+*.aps
+*.user
+
+# Exploratory research, not part of the plugin itself
+tools/DeepNormals/
+tools/deepnormals_env/
+tools/*.zip
+
+# The Adobe After Effects SDK is proprietary and must be downloaded
+# separately from https://developer.adobe.com/console/servicesandapis/ae
+# It is NOT vendored in this repo.

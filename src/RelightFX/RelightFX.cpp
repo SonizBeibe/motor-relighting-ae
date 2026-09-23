@@ -1,10 +1,12 @@
 /*
     RelightFX.cpp
 
-    Heuristic real-time relight: builds a Sobel-based normal map from the
-    layer's own luma every frame and shades it against a directional light
-    rig (Light Position -> Point of Interest, same convention as AE's own
-    Light layers).
+    Real-time relight for line art: a cached, OpenCV-based hybrid normal map
+    (per-region distance-field relief over the whole silhouette, plus an
+    analytic face ellipsoid + nose bump + eye protection when a face is
+    detected) shaded against a directional light rig (Light Position ->
+    Point of Interest, same convention as AE's own Light layers). See
+    JULES_TASK.md for the full pipeline spec.
 
     NOTE: the Z axis here is a local axis for the light rig, not AE's real
     3D camera space yet -- dragging the points changes the light direction
@@ -17,7 +19,67 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <fstream>
 #include <opencv2/opencv.hpp>
+#include <delayimp.h>
+
+// Temporary diagnostic logging while tracking down why the render produces
+// no visible shading in AE. Remove once resolved.
+static std::string GetPluginDirectory(); // fwd decl, defined below
+
+static void DebugLog(const std::string& msg)
+{
+    std::string path = GetPluginDirectory() + "relightfx_debug.log";
+    std::ofstream f(path, std::ios::app);
+    if (f)
+    {
+        f << msg << std::endl;
+    }
+}
+
+// Resolves to the folder this .aex itself lives in, so auxiliary files (the
+// face cascade) can be found regardless of AE's current working directory.
+static std::string GetPluginDirectory()
+{
+    HMODULE hModule = NULL;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&GetPluginDirectory,
+            &hModule))
+    {
+        return std::string();
+    }
+
+    char pathBuf[MAX_PATH];
+    DWORD len = GetModuleFileNameA(hModule, pathBuf, MAX_PATH);
+    if (len == 0 || len == MAX_PATH)
+    {
+        return std::string();
+    }
+
+    std::string path(pathBuf, len);
+    size_t slash = path.find_last_of("\\/");
+    return (slash == std::string::npos) ? std::string() : path.substr(0, slash + 1);
+}
+
+// opencv_world*.dll is delay-loaded (see DelayLoadDLLs in RelightFX.vcxproj):
+// Windows' default DLL search order for an implicitly-linked dependency looks
+// next to the HOST executable (AfterFX.exe), not next to the plugin that
+// actually needs it, so a plain implicit link never finds a DLL sitting in
+// the Plug-ins folder. This hook runs only if the normal delay-load search
+// fails, and resolves the DLL explicitly from this .aex's own folder.
+static FARPROC WINAPI DelayLoadFailureHook(unsigned dliNotify, PDelayLoadInfo pdli)
+{
+    if (dliNotify == dliFailLoadLib)
+    {
+        std::string dllPath = GetPluginDirectory() + pdli->szDll;
+        HMODULE h = LoadLibraryA(dllPath.c_str());
+        return (FARPROC)h;
+    }
+    return NULL;
+}
+
+extern "C" const PfnDliHook __pfnDliFailureHook2 = DelayLoadFailureHook;
 
 static inline float ClampF(float v, float lo, float hi)
 {
@@ -44,7 +106,13 @@ static PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     out_data->my_version = PF_VERSION(MAJOR_VERSION, MINOR_VERSION, BUG_VERSION, STAGE_VERSION, BUILD_VERSION);
 
     out_data->out_flags = PF_OutFlag_DEEP_COLOR_AWARE;
-    out_data->out_flags2 = PF_OutFlag2_SUPPORTS_THREADED_RENDERING;
+    // MUTABLE_RENDER_SEQUENCE_DATA_SLOWER: without it, in_data->sequence_data
+    // is NULL during PF_Cmd_RENDER when SUPPORTS_THREADED_RENDERING is set,
+    // which silently disabled the whole normal-map cache (Render() always
+    // fell through to a plain passthrough copy). This trades a small perf
+    // cost (sequence_data is per-render-thread and dropped between preview
+    // spans) for the cache actually working at all.
+    out_data->out_flags2 = PF_OutFlag2_SUPPORTS_THREADED_RENDERING | PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER;
 
     return PF_Err_NONE;
 }
@@ -185,31 +253,34 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef*
     return err;
 }
 
-// Single-threaded 3x3 Sobel pass over a height source's luma. Needs neighbor
-// pixels, so it reads the world directly instead of going through PF's
-// per-pixel iterate suite (which only ever sees one pixel at a time).
+// Runs the full Steps 1-4 pipeline (segmentation, per-region distance
+// transform, height shaping, Sobel normal extraction, face-aware
+// enhancement). This is the expensive part that gets cached -- see Render().
 //
-// outSizeP dictates how big gx/gy are (matches the layer being shaded);
-// heightSrcP is what's actually sampled for luma -- either the layer's own
-// artwork (heuristic edge-based relief) or a separately painted height-map
-// layer (smooth, art-directed relief). Coordinates are clamped to
-// heightSrcP's own bounds, so a mismatched size just clamps to its edge
-// instead of crashing -- lining the two layers up is on the user.
+// outSizeP dictates the output dimensions and supplies alpha/silhouette
+// (always the actual artwork being shaded); heightSrcP is what's sampled for
+// luma -- either that same artwork (heuristic edge-based relief) or a
+// separately painted height-map layer (smooth, art-directed relief) when one
+// is assigned. Luma coordinates are clamped to heightSrcP's own bounds, so a
+// mismatched size just clamps to its edge instead of crashing -- lining the
+// two layers up is on the user.
 static void ComputeNormalMapWithOpenCV(
     PF_InData* in_data,
-    PF_EffectWorld* input,
+    PF_EffectWorld* outSizeP,
+    PF_EffectWorld* heightSrcP,
     float blurRadius,
     float heightExponent,
     float coarseStrength,
     float fineStrength,
+    float normalStrength,
     bool enableFaceDetection,
     cv::CascadeClassifier* face_cascade,
     std::vector<float>& out_normals,
     std::vector<float>& out_eye_mask)
 {
     AEGP_SuiteHandler suites(in_data->pica_basicP);
-    const int width = input->width;
-    const int height = input->height;
+    const int width = outSizeP->width;
+    const int height = outSizeP->height;
     const size_t count = (size_t)width * (size_t)height;
 
     out_normals.assign(count * 3, 0.0f);
@@ -221,7 +292,10 @@ static void ComputeNormalMapWithOpenCV(
     {
         for (int x = 0; x < width; ++x)
         {
-            PF_Pixel8* p = (PF_Pixel8*)((char*)input->data + (size_t)y * input->rowbytes + (size_t)x * sizeof(PF_Pixel8));
+            const int hx = ClampL(x, 0, heightSrcP->width - 1);
+            const int hy = ClampL(y, 0, heightSrcP->height - 1);
+            PF_Pixel8* p =
+                (PF_Pixel8*)((char*)heightSrcP->data + (size_t)hy * heightSrcP->rowbytes + (size_t)hx * sizeof(PF_Pixel8));
             float l = 0.299f * p->red + 0.587f * p->green + 0.114f * p->blue;
             luma.at<float>(y, x) = l / 255.0f;
         }
@@ -238,7 +312,9 @@ static void ComputeNormalMapWithOpenCV(
     {
         for (int x = 0; x < width; ++x)
         {
-            PF_Pixel8* p = (PF_Pixel8*)((char*)input->data + (size_t)y * input->rowbytes + (size_t)x * sizeof(PF_Pixel8));
+            // Silhouette/alpha always comes from the actual artwork being
+            // shaded, not the (possibly differently-sized) height map.
+            PF_Pixel8* p = (PF_Pixel8*)((char*)outSizeP->data + (size_t)y * outSizeP->rowbytes + (size_t)x * sizeof(PF_Pixel8));
             float b_luma = blurred_luma.at<float>(y, x);
 
             // True / 0 where there's solid dark ink, False / 255 elsewhere. Combine with alpha.
@@ -367,8 +443,10 @@ static void ComputeNormalMapWithOpenCV(
     {
         for (int x = 0; x < width; ++x)
         {
-            dx_combined.at<float>(y, x) = dx_fine.at<float>(y, x) * fineStrength + dx_coarse.at<float>(y, x) * coarseStrength;
-            dy_combined.at<float>(y, x) = dy_fine.at<float>(y, x) * fineStrength + dy_coarse.at<float>(y, x) * coarseStrength;
+            dx_combined.at<float>(y, x) =
+                (dx_fine.at<float>(y, x) * fineStrength + dx_coarse.at<float>(y, x) * coarseStrength) * normalStrength;
+            dy_combined.at<float>(y, x) =
+                (dy_fine.at<float>(y, x) * fineStrength + dy_coarse.at<float>(y, x) * coarseStrength) * normalStrength;
         }
     }
 
@@ -422,12 +500,15 @@ static void ComputeNormalMapWithOpenCV(
                     float nv = (y - nose_cy) / nose_ry;
                     float nd_sq = nu * nu + nv * nv;
 
+                    // Nose bump perturbation, scaled down so it reads as a small
+                    // highlight breaking into the shadow rather than dominating
+                    // the whole face ellipsoid.
+                    const float kNoseStrength = 0.55f;
                     float bump_u = 0, bump_v = 0;
                     if (nd_sq <= 1.0f)
                     {
-                        float nw = std::sqrt(std::max(0.0f, 1.0f - nd_sq));
-                        bump_u = nu;
-                        bump_v = nv;
+                        bump_u = nu * kNoseStrength;
+                        bump_v = nv * kNoseStrength;
                     }
 
                     // Main face ellipsoid
@@ -439,7 +520,7 @@ static void ComputeNormalMapWithOpenCV(
 
                     face_nx = u + bump_u + dx_fine.at<float>(y, x) * fineStrength * 0.1f;
                     face_ny = v + bump_v + dy_fine.at<float>(y, x) * fineStrength * 0.1f;
-                    face_nz = w + 1.0f; // Additive z, approx
+                    face_nz = w;
 
                     // Blend factor (75% to 115%)
                     float dist = std::sqrt(d_sq);
@@ -504,7 +585,6 @@ struct CombineRefcon
     const float* normals;
     const float* eye_mask;
     A_long width;
-    float normal_strength;
     A_long mode;
     float intensityF;
     float shadow_hardness;
@@ -597,10 +677,13 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
     PF_Err err = PF_Err_NONE, err2 = PF_Err_NONE;
     AEGP_SuiteHandler suites(in_data->pica_basicP);
 
+    DebugLog("=== Render() called ===");
+
     PF_EffectWorld* srcP = &params[RELIGHT_INPUT]->u.ld;
 
     if (PF_WORLD_IS_DEEP(output))
     {
+        DebugLog("PF_WORLD_IS_DEEP -> early return (16bpc passthrough)");
         // 16bpc path not implemented yet; keep the effect harmless on deep worlds.
         ERR(suites.WorldTransformSuite1()->copy(in_data->effect_ref, srcP, output, NULL, NULL));
         return err;
@@ -610,7 +693,17 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
     float heightExponent = (float)params[RELIGHT_HEIGHT_CURVE_EXPONENT]->u.fs_d.value;
     float coarseStrength = (float)params[RELIGHT_COARSE_DETAIL_STRENGTH]->u.fs_d.value / 100.0f;
     float fineStrength = (float)params[RELIGHT_FINE_DETAIL_STRENGTH]->u.fs_d.value / 100.0f;
+    float normalStrength = (float)params[RELIGHT_NORMAL_STRENGTH]->u.fs_d.value / 100.0f;
     bool enableFaceDetection = params[RELIGHT_ENABLE_FACE_DETECTION]->u.bd.value != 0;
+
+    PF_ParamDef heightmap_checkout;
+    AEFX_CLR_STRUCT(heightmap_checkout);
+    ERR(PF_CHECKOUT_PARAM(
+        in_data, RELIGHT_HEIGHTMAP, in_data->current_time, in_data->time_step, in_data->time_scale, &heightmap_checkout));
+    PF_EffectWorld* heightSrcP = (!err && heightmap_checkout.u.ld.data) ? &heightmap_checkout.u.ld : srcP;
+    DebugLog(
+        "after heightmap checkout: err=" + std::to_string(err) + " srcP=" + std::to_string(srcP->width) + "x" +
+        std::to_string(srcP->height) + " heightSrcP==srcP? " + std::to_string(heightSrcP == srcP));
 
     size_t param_hash = 0;
     // Simple hash to invalidate cache based purely on input buffer + params
@@ -619,21 +712,29 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
     param_hash ^= std::hash<float>()(heightExponent) + 0x9e3779b9 + (param_hash << 6) + (param_hash >> 2);
     param_hash ^= std::hash<float>()(coarseStrength) + 0x9e3779b9 + (param_hash << 6) + (param_hash >> 2);
     param_hash ^= std::hash<float>()(fineStrength) + 0x9e3779b9 + (param_hash << 6) + (param_hash >> 2);
+    param_hash ^= std::hash<float>()(normalStrength) + 0x9e3779b9 + (param_hash << 6) + (param_hash >> 2);
     param_hash ^= std::hash<bool>()(enableFaceDetection) + 0x9e3779b9 + (param_hash << 6) + (param_hash >> 2);
+    param_hash ^= std::hash<bool>()(heightSrcP != srcP) + 0x9e3779b9 + (param_hash << 6) + (param_hash >> 2);
 
-    // Fast checksum of input pixels (using a stride for performance)
+    // Fast checksum of input pixels (using a stride for performance). Hash
+    // whichever buffer actually feeds the height pipeline (the optional
+    // height-map layer when assigned, otherwise the artwork itself), so an
+    // edit to either one correctly invalidates the cache.
     size_t pixel_hash = 0;
     const int stride = 16;
-    for (int y = 0; y < srcP->height; y += stride)
+    for (int y = 0; y < heightSrcP->height; y += stride)
     {
-        for (int x = 0; x < srcP->width; x += stride)
+        for (int x = 0; x < heightSrcP->width; x += stride)
         {
-            PF_Pixel8* p = (PF_Pixel8*)((char*)srcP->data + (size_t)y * srcP->rowbytes + (size_t)x * sizeof(PF_Pixel8));
+            PF_Pixel8* p =
+                (PF_Pixel8*)((char*)heightSrcP->data + (size_t)y * heightSrcP->rowbytes + (size_t)x * sizeof(PF_Pixel8));
             size_t val = (p->alpha << 24) | (p->red << 16) | (p->green << 8) | p->blue;
             pixel_hash ^= std::hash<size_t>()(val) + 0x9e3779b9 + (pixel_hash << 6) + (pixel_hash >> 2);
         }
     }
     param_hash ^= pixel_hash + 0x9e3779b9 + (param_hash << 6) + (param_hash >> 2);
+
+    DebugLog("in_data->sequence_data is " + std::string(in_data->sequence_data ? "non-null" : "NULL"));
 
     RelightSeqData* seq_data = NULL;
     if (in_data->sequence_data)
@@ -641,10 +742,19 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         seq_data = (RelightSeqData*)suites.HandleSuite1()->host_lock_handle(in_data->sequence_data);
     }
 
+    DebugLog("seq_data is " + std::string(seq_data ? "non-null" : "NULL"));
+
     if (seq_data)
     {
+        DebugLog(
+            "seq_data->width=" + std::to_string(seq_data->width) + " height=" + std::to_string(seq_data->height) +
+            " param_hash=" + std::to_string(seq_data->param_hash) + " new_hash=" + std::to_string(param_hash) +
+            " cache=" + std::string(seq_data->normal_eye_cache ? "set" : "NULL") + " cascade_loaded=" +
+            std::to_string(seq_data->cascade_loaded));
+
         if (seq_data->width != srcP->width || seq_data->height != srcP->height || seq_data->param_hash != param_hash || seq_data->normal_eye_cache == NULL)
         {
+            DebugLog("Recomputing normal map cache...");
             if (seq_data->normal_eye_cache)
             {
                 suites.HandleSuite1()->host_dispose_handle(seq_data->normal_eye_cache);
@@ -653,10 +763,28 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
 
             std::vector<float> normals;
             std::vector<float> eye_mask;
-            ComputeNormalMapWithOpenCV(in_data, srcP, blurRadius, heightExponent, coarseStrength, fineStrength, enableFaceDetection, seq_data->face_cascade, normals, eye_mask);
+            ComputeNormalMapWithOpenCV(
+                in_data,
+                srcP,
+                heightSrcP,
+                blurRadius,
+                heightExponent,
+                coarseStrength,
+                fineStrength,
+                normalStrength,
+                enableFaceDetection,
+                seq_data->face_cascade,
+                normals,
+                eye_mask);
+            DebugLog(
+                "ComputeNormalMapWithOpenCV returned. normals.size()=" + std::to_string(normals.size()) +
+                " eye_mask.size()=" + std::to_string(eye_mask.size()));
 
             size_t bytes = normals.size() * sizeof(float) + eye_mask.size() * sizeof(float);
+            DebugLog("Allocating handle of " + std::to_string(bytes) + " bytes...");
             seq_data->normal_eye_cache = suites.HandleSuite1()->host_new_handle(bytes);
+            DebugLog(
+                std::string("host_new_handle returned ") + (seq_data->normal_eye_cache ? "non-null" : "NULL"));
             if (seq_data->normal_eye_cache)
             {
                 float* ptr = (float*)suites.HandleSuite1()->host_lock_handle(seq_data->normal_eye_cache);
@@ -668,6 +796,10 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
             seq_data->width = srcP->width;
             seq_data->height = srcP->height;
             seq_data->param_hash = param_hash;
+        }
+        else
+        {
+            DebugLog("Cache hit, reusing existing normal map.");
         }
     }
 
@@ -698,18 +830,19 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
         cache_ptr = (float*)suites.HandleSuite1()->host_lock_handle(seq_data->normal_eye_cache);
     }
 
+    DebugLog(std::string("cache_ptr is ") + (cache_ptr ? "VALID -> will shade" : "NULL -> will passthrough-copy"));
+
     if (cache_ptr)
     {
         CombineRefcon rc;
         rc.normals = cache_ptr;
         rc.eye_mask = cache_ptr + (size_t)srcP->width * (size_t)srcP->height * 3;
         rc.width = srcP->width;
-        rc.normal_strength = (float)params[RELIGHT_NORMAL_STRENGTH]->u.fs_d.value;
         rc.mode = params[RELIGHT_MODE]->u.pd.value;
         rc.intensityF = (float)(params[RELIGHT_LIGHT_INTENSITY]->u.fs_d.value / 100.0);
         rc.shadow_hardness = (float)params[RELIGHT_SHADOW_HARDNESS]->u.fs_d.value;
         rc.eye_protection_strength = (float)params[RELIGHT_EYE_PROTECTION_STRENGTH]->u.fs_d.value / 100.0f;
-        rc.light_color = params[RELIGHT_LIGHT_COLOR]->u.cd;
+        rc.light_color = params[RELIGHT_LIGHT_COLOR]->u.cd.value;
         rc.Lx = (float)-dx;
         rc.Ly = (float)-dy;
         rc.Lz = (float)-dz;
@@ -738,6 +871,10 @@ static PF_Err Render(PF_InData* in_data, PF_OutData* out_data, PF_ParamDef* para
     {
         suites.HandleSuite1()->host_unlock_handle(in_data->sequence_data);
     }
+
+    ERR2(PF_CHECKIN_PARAM(in_data, &heightmap_checkout)); // always check in, even if no layer was assigned
+
+    DebugLog("Render() returning err=" + std::to_string(err));
 
     return err;
 }
@@ -788,6 +925,7 @@ PF_Err EffectMain(
         case PF_Cmd_SEQUENCE_SETUP:
         case PF_Cmd_SEQUENCE_RESETUP:
         {
+            DebugLog(std::string("=== ") + (cmd == PF_Cmd_SEQUENCE_SETUP ? "SEQUENCE_SETUP" : "SEQUENCE_RESETUP") + " called ===");
             AEGP_SuiteHandler suites(in_data->pica_basicP);
             PF_Handle seq_handle = suites.HandleSuite1()->host_new_handle(sizeof(RelightSeqData));
             if (seq_handle)
@@ -802,19 +940,26 @@ PF_Err EffectMain(
                     seq_data->cascade_loaded = false;
                     seq_data->face_cascade = new cv::CascadeClassifier();
 
-                    // TODO: Construct path dynamically based on AE plugin path mechanism. Using relative for now.
-                    std::string cascade_path = "lbpcascade_animeface.xml";
+                    std::string cascade_path = GetPluginDirectory() + "lbpcascade_animeface.xml";
+                    DebugLog("Loading cascade from: " + cascade_path);
                     if (seq_data->face_cascade->load(cascade_path))
                     {
                         seq_data->cascade_loaded = true;
                     }
+                    DebugLog("cascade_loaded=" + std::to_string(seq_data->cascade_loaded));
 
                     suites.HandleSuite1()->host_unlock_handle(seq_handle);
                     out_data->sequence_data = seq_handle;
+                    DebugLog("out_data->sequence_data set successfully.");
+                }
+                else
+                {
+                    DebugLog("SEQUENCE_SETUP: host_lock_handle(seq_handle) returned NULL!");
                 }
             }
             else
             {
+                DebugLog("SEQUENCE_SETUP: host_new_handle(sizeof(RelightSeqData)) returned NULL!");
                 err = PF_Err_OUT_OF_MEMORY;
             }
             break;
@@ -857,6 +1002,18 @@ PF_Err EffectMain(
     catch (PF_Err& thrown_err)
     {
         err = thrown_err;
+    }
+    catch (const std::exception&)
+    {
+        // Covers cv::Exception (OpenCV) and any other std::exception thrown
+        // from the new pipeline -- letting one of these escape uncaught
+        // across the plugin boundary is what previously made AE report a
+        // generic "couldn't find main entry point" instead of a real error.
+        err = PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+    catch (...)
+    {
+        err = PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
     return err;
 }

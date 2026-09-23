@@ -44,7 +44,7 @@ resource 'PiPL' (16000) {
 			0x02000000
 		},
 		AE_Effect_Global_OutFlags_2 {
-			0x08000000 /* PF_OutFlag2_SUPPORTS_THREADED_RENDERING */
+			0x18000000 /* PF_OutFlag2_SUPPORTS_THREADED_RENDERING | PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER */
 		},
 		AE_Effect_Match_Name {
 			"ADBE RelightFX"

@@ -72,6 +72,13 @@ enum
     RELIGHT_MODE,
     RELIGHT_PREVIEW_NORMALS,
     RELIGHT_HEIGHTMAP,
+    RELIGHT_SHADOW_HARDNESS,
+    RELIGHT_HEIGHT_BLUR_RADIUS,
+    RELIGHT_HEIGHT_CURVE_EXPONENT,
+    RELIGHT_COARSE_DETAIL_STRENGTH,
+    RELIGHT_FINE_DETAIL_STRENGTH,
+    RELIGHT_ENABLE_FACE_DETECTION,
+    RELIGHT_EYE_PROTECTION_STRENGTH,
     RELIGHT_NUM_PARAMS
 };
 
@@ -85,6 +92,27 @@ enum
     MODE_DISK_ID,
     PREVIEW_NORMALS_DISK_ID,
     HEIGHTMAP_DISK_ID,
+    SHADOW_HARDNESS_DISK_ID,
+    HEIGHT_BLUR_RADIUS_DISK_ID,
+    HEIGHT_CURVE_EXPONENT_DISK_ID,
+    COARSE_DETAIL_STRENGTH_DISK_ID,
+    FINE_DETAIL_STRENGTH_DISK_ID,
+    ENABLE_FACE_DETECTION_DISK_ID,
+    EYE_PROTECTION_STRENGTH_DISK_ID,
+};
+
+// Forward declare cv::CascadeClassifier for use in RelightSeqData
+namespace cv { class CascadeClassifier; }
+
+struct RelightSeqData
+{
+    PF_Handle normal_eye_cache;
+    A_long width;
+    A_long height;
+    size_t param_hash;
+
+    bool cascade_loaded;
+    cv::CascadeClassifier* face_cascade;
 };
 
 extern "C"
